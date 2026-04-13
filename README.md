@@ -1,2 +1,12 @@
-# study-notes-and-projects
-My learning journey, study notes and projects.
+# Haoyu-Tian's Learning Journey & Academic Portfolio
+> 记录我的考研备考、专业学习、项目实践与技术成长历程
+---
+## 关于我
+- **本科院校**：安阳师范学院
+- **就读专业**：软件工程
+- **研究方向**：云计算/计算机视觉/深度学习
+- **个人简介**：热爱编程与技术，持续深耕专业知识致力于通过项目落地提升工程能力。
+
+---
+
+## 仓库目录结构
