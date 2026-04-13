@@ -1,5 +1,5 @@
 # Haoyu-Tian's Learning Journey & Academic Portfolio
-> 记录我的考研备考、专业学习、项目实践与技术成长历程
+> 记录我的专业学习、项目实践与技术成长历程
 ---
 ## 关于我
 - **本科院校**：安阳师范学院
