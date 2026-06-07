@@ -1,0 +1,55 @@
+import sqlite3
+from datetime import datetime
+
+DB_FILE = "attendance.db"
+
+conn = sqlite3.connect(DB_FILE)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+
+cur.execute("""
+SELECT name
+FROM sqlite_master
+WHERE type='table'
+ORDER BY name;
+""")
+
+tables = cur.fetchall()
+
+for table in tables:
+    table_name = table["name"]
+
+    print("\n" + "=" * 80)
+    print(f"表: {table_name}")
+    print("=" * 80)
+
+    cur.execute(f"SELECT * FROM {table_name}")
+    rows = cur.fetchall()
+
+    if not rows:
+        print("空表")
+        continue
+
+    columns = rows[0].keys()
+    print(" | ".join(columns))
+
+    for row in rows:
+        values = []
+
+        for col in columns:
+            value = row[col]
+
+            # attendance_status表中的last_time转换
+            if table_name == "attendance_status" and col == "last_time":
+                try:
+                    value = datetime.fromtimestamp(float(value)).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                except:
+                    pass
+
+            values.append(str(value))
+
+        print(" | ".join(values))
+
+conn.close()
