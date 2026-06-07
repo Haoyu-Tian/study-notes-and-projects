@@ -1,0 +1,2025 @@
+# -*- coding: utf-8 -*-
+"""
+人脸识别智能考勤管理系统 —— 优化版
+=====================================
+在基础版基础上的改进项：
+  1. threading.Lock 保护共享状态（并发安全）
+     所有对 attendance_status / attendance_log 的读写操作
+     均在 RLock 保护下完成，消除主线程与导出线程的竞态条件。
+
+  2. logging 替代 print（统一日志）
+     控制台输出 INFO 级别，文件按天滚动输出 DEBUG 级别，
+     统一格式包含时间戳、级别、模块名，便于问题追溯。
+
+  3. 完善错误处理（不再静默吞异常）
+     每个可能失败的操作都有具体的异常类型捕获和日志记录，
+     单张照片加载失败不影响其他照片，检测异常不导致程序崩溃。
+
+  4. 类职责拆分
+     FaceRecognizer   —— 人脸库加载与身份识别
+     AttendanceManager —— 打卡状态与日志管理（含锁保护）
+     UIRenderer       —— 所有 OpenCV / PIL 绘制逻辑
+     AttendanceSystem —— 组合以上三者，驱动主循环
+
+  5. 字体缓存 LRU 上限（防无限增长）
+     使用 OrderedDict 实现 LRU 淘汰策略，
+     最多缓存 FONT_CACHE_MAX 个字体对象，超出后淘汰最久未用的。
+
+  6. 面板时钟与打卡状态分离刷新频率
+     打卡统计/最近记录每 0.5s 刷新（status 层）；
+     时钟每帧无条件覆盖渲染，彻底消除秒针跳变时的闪烁问题。
+"""
+
+import cv2
+import numpy as np
+import os
+import json
+import time
+import logging
+import logging.handlers
+from datetime import datetime, timedelta
+from functools import lru_cache
+from insightface.app import FaceAnalysis
+from PIL import Image, ImageDraw, ImageFont
+import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+import threading
+import queue
+from collections import deque, OrderedDict
+
+
+# ============================================================
+#                        日志配置模块
+# ============================================================
+
+def setup_logger(log_dir: str = "logs") -> logging.Logger:
+    """
+    初始化全局日志记录器（改进2：用 logging 替代 print）。
+
+    配置策略：
+        - 控制台 Handler：输出 INFO 及以上级别，适合运行时监控。
+        - 文件 Handler  ：输出 DEBUG 及以上级别，按天滚动，保留 7 天，
+                          适合问题排查和历史追溯。
+        - 统一日志格式  ：[时间戳] 级别 模块名 - 消息内容。
+
+    Args:
+        log_dir (str): 日志文件存放目录，默认 "logs"，不存在时自动创建。
+
+    Returns:
+        logging.Logger: 配置完成的日志记录器实例，名称为 "attendance"。
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    logger = logging.getLogger("attendance")
+    logger.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        "[%(asctime)s] %(levelname)-8s %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # 控制台 Handler：INFO 及以上，适合日常运行观察
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+
+    # 滚动文件 Handler：DEBUG 及以上，每天零点生成新文件，保留最近 7 天
+    fh = logging.handlers.TimedRotatingFileHandler(
+        os.path.join(log_dir, "attendance.log"),
+        when="midnight", backupCount=7, encoding="utf-8"
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    return logger
+
+
+# 模块级全局日志记录器，供所有模块统一使用
+logger = setup_logger()
+
+
+# ============================================================
+#                         全局配置
+# ============================================================
+
+# ---------- 文件路径 ----------
+KNOWN_FACES_DIR = "known_faces"            # 已知人员照片目录
+STATE_FILE      = "attendance_state.json"  # 当日考勤状态持久化文件
+LOG_FILE        = "attendance_log.json"    # 打卡流水日志文件
+EXPORT_DIR      = "attendance_reports"     # Excel 报表输出目录
+
+# ---------- 识别与打卡参数 ----------
+SIMILARITY_THRESHOLD = 0.35  # 人脸相似度阈值，低于此值视为未知人员
+CONFIRM_FRAMES       = 6     # 连续检测到同一人至少 N 帧后才触发打卡
+COOLDOWN_SECONDS     = 5     # 同一人两次打卡之间的最短冷却时间（秒）
+DETECT_INTERVAL      = 2     # 每隔 N 帧执行一次人脸检测，降低 CPU 占用
+
+# ---------- 摄像头分辨率 ----------
+CAMERA_WIDTH  = 1280
+CAMERA_HEIGHT = 720
+
+# ---------- UI 字体路径 ----------
+FONT_PATH      = "C:/Windows/Fonts/msyh.ttc"    # 微软雅黑常规体
+FONT_PATH_BOLD = "C:/Windows/Fonts/msyhbd.ttc"  # 微软雅黑粗体
+
+# ---------- 窗口与布局 ----------
+WINDOW_NAME  = "Face Attendance System"  # OpenCV 窗口标题
+PANEL_RATIO  = 0.22                      # 右侧信息面板占总窗口宽度的比例
+
+# ---------- 通知显示 ----------
+MAX_NOTIFICATIONS = 4  # 同一时刻最多并排显示的打卡通知条数
+
+# ---------- 面板分层刷新频率（改进6）----------
+PANEL_STATUS_TTL = 0.5  # 打卡统计/最近记录层的缓存有效期（秒）
+PANEL_CLOCK_TTL  = 0.2  # 时钟层的缓存有效期（秒），秒级精度足够
+
+# ---------- 字体缓存上限（改进5）----------
+FONT_CACHE_MAX = 32  # LRU 字体缓存最大条目数，超出后淘汰最久未用的
+
+# ---------- 颜色常量（BGR 格式）----------
+C_BG_PANEL = (45,  45,  45 )  # 面板背景色（深灰）
+C_ACCENT   = (0,   200, 100)  # 主强调色（绿色）
+C_ACCENT2  = (0,   160, 255)  # 副强调色（蓝色）
+C_WHITE    = (240, 240, 240)  # 近白色
+C_GRAY     = (160, 160, 160)  # 灰色，用于次要文字
+C_GREEN    = (0,   220, 80 )  # 绿色，表示签到/在岗
+C_CYAN     = (200, 220, 0  )  # 青黄色，用于工时信息
+C_ORANGE   = (0,   165, 255)  # 橙色，表示签退/警告
+C_RED      = (60,  60,  220)  # 红色（BGR），表示错误/异常
+C_BORDER   = (80,  80,  80 )  # 边框线颜色
+C_UNKNOWN  = (0,   220, 220)  # 黄色，表示未知人员人脸框
+
+
+# ============================================================
+#              改进5：字体缓存（LRU + 容量上限）
+# ============================================================
+
+class _LRUFontCache:
+    """
+    基于 OrderedDict 实现的 LRU（最近最少使用）字体缓存。
+
+    解决问题：
+        原版字典缓存无上限，若程序长期运行且使用了多种字号，
+        缓存条目会无限积累，造成内存泄漏。
+
+    LRU 淘汰策略：
+        - 命中缓存时：将该条目移到末尾（标记为最近使用）。
+        - 新增条目时：若已达上限，弹出头部（最久未使用）的条目。
+
+    线程安全：
+        内部使用 threading.Lock 保护，支持多线程并发访问。
+
+    字体加载降级策略（改进3）：
+        粗体路径失败 → 回退常规体路径 → 回退 PIL 内置字体，
+        每一级失败都记录日志，不静默吞异常。
+    """
+
+    def __init__(self, maxsize: int = FONT_CACHE_MAX):
+        """
+        Args:
+            maxsize (int): 缓存最大条目数，默认 FONT_CACHE_MAX（32）。
+        """
+        self._cache: OrderedDict = OrderedDict()
+        self._maxsize = maxsize
+        self._lock = threading.Lock()
+
+    def get(self, size: int, bold: bool) -> ImageFont.FreeTypeFont:
+        """
+        获取指定字号和字重的 PIL 字体对象（优先从缓存取，未命中则加载）。
+
+        Args:
+            size (int) : 字号（像素）。
+            bold (bool): 是否使用粗体。
+
+        Returns:
+            ImageFont.FreeTypeFont: PIL 字体对象。
+        """
+        key = (size, bold)
+        with self._lock:
+            if key in self._cache:
+                # 命中缓存：移到末尾，标记为最近使用
+                self._cache.move_to_end(key)
+                return self._cache[key]
+
+            # 未命中：尝试加载字体文件（改进3：捕获具体异常并分级处理）
+            try:
+                path = FONT_PATH_BOLD if bold else FONT_PATH
+                font = ImageFont.truetype(path, size)
+            except OSError as e:
+                logger.warning("字体加载失败 (%s size=%d)，回退到默认字体: %s",
+                               path, size, e)
+                try:
+                    # 第一级回退：使用常规体路径
+                    font = ImageFont.truetype(FONT_PATH, size)
+                except OSError:
+                    # 第二级回退：使用 PIL 内置位图字体（不支持中文，仅保证不崩溃）
+                    logger.error("默认字体也无法加载，使用 PIL 内置字体")
+                    font = ImageFont.load_default()
+
+            # 超出容量：淘汰最久未使用的条目（头部）
+            if len(self._cache) >= self._maxsize:
+                evicted = self._cache.popitem(last=False)
+                logger.debug("字体缓存淘汰: key=%s", evicted[0])
+
+            self._cache[key] = font
+            return font
+
+
+# 模块级 LRU 字体缓存单例
+_font_cache = _LRUFontCache()
+
+
+def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    """
+    获取 PIL 字体对象的公共接口（委托给 LRU 缓存）。
+
+    Args:
+        size (int) : 字号（像素）。
+        bold (bool): 是否使用粗体，默认 False。
+
+    Returns:
+        ImageFont.FreeTypeFont: 对应的 PIL 字体对象。
+    """
+    return _font_cache.get(size, bold)
+
+
+# ============================================================
+#                       文字渲染工具
+# ============================================================
+
+def draw_texts(img_bgr: np.ndarray, items: list) -> np.ndarray:
+    """
+    批量在 BGR 图像上渲染中文文字（使用 PIL 绘制，避免 OpenCV 中文乱码）。
+
+    性能优化：整个批次只做一次 BGR→RGB→BGR 颜色空间转换，
+    相比逐条调用可显著减少转换开销。
+
+    Args:
+        img_bgr (np.ndarray): 输入的 BGR 图像。
+        items   (list)       : 文字绘制参数列表，每项格式为：
+            (text, (x, y), color_bgr, size, bold)
+            - text      (str)  : 要绘制的文字内容
+            - (x, y)   (tuple): 文字左上角坐标（像素）
+            - color_bgr (tuple): 文字颜色，BGR 格式
+            - size      (int)  : 字号（像素）
+            - bold      (bool) : 是否粗体
+
+    Returns:
+        np.ndarray: 绘制文字后的 BGR 图像。
+    """
+    if not items:
+        return img_bgr
+    # BGR → RGB，转为 PIL 可处理的格式
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+    draw    = ImageDraw.Draw(pil_img)
+    for text, pos, color_bgr, size, bold in items:
+        font      = get_font(size, bold)
+        # PIL 使用 RGB 颜色顺序，将 BGR 分量反转
+        pil_color = (color_bgr[2], color_bgr[1], color_bgr[0])
+        draw.text(pos, text, font=font, fill=pil_color)
+    # RGB → BGR，转回 OpenCV 格式
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def draw_text(img_bgr, text, pos, color, size, bold=False):
+    """
+    在 BGR 图像上绘制单条中文文字（兼容旧调用接口）。
+
+    内部复用 draw_texts，保持接口一致性。
+
+    Args:
+        img_bgr (np.ndarray): 输入的 BGR 图像。
+        text    (str)        : 要绘制的文字内容。
+        pos     (tuple)      : 文字左上角坐标 (x, y)。
+        color   (tuple)      : 文字颜色，BGR 格式。
+        size    (int)        : 字号（像素）。
+        bold    (bool)       : 是否粗体，默认 False。
+
+    Returns:
+        np.ndarray: 绘制文字后的 BGR 图像。
+    """
+    return draw_texts(img_bgr, [(text, pos, color, size, bold)])
+
+
+def blend_rect(img, pt1, pt2, color, alpha=0.55):
+    """
+    在图像指定区域绘制半透明填充矩形（Alpha 混合）。
+
+    通过 cv2.addWeighted 将纯色矩形与原图 ROI 混合，实现毛玻璃/遮罩效果。
+    坐标会自动裁剪到图像边界内，防止越界访问。
+
+    Args:
+        img   (np.ndarray): 目标 BGR 图像（原地修改）。
+        pt1   (tuple)     : 矩形左上角坐标 (x1, y1)。
+        pt2   (tuple)     : 矩形右下角坐标 (x2, y2)。
+        color (tuple)     : 填充颜色，BGR 格式。
+        alpha (float)     : 遮罩不透明度（0.0=完全透明，1.0=完全不透明），默认 0.55。
+
+    Returns:
+        np.ndarray: 混合后的 BGR 图像（与输入共享内存）。
+    """
+    x1, y1 = pt1; x2, y2 = pt2
+    # 坐标裁剪，防止超出图像边界
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(img.shape[1] - 1, x2)
+    y2 = min(img.shape[0] - 1, y2)
+    if x2 <= x1 or y2 <= y1:
+        return img  # 无效区域，直接返回
+    roi = img[y1:y2, x1:x2]
+    cv2.addWeighted(np.full_like(roi, color), alpha,
+                    roi, 1 - alpha, 0, roi)
+    img[y1:y2, x1:x2] = roi
+    return img
+
+
+# ============================================================
+#                      考勤计算模块
+# ============================================================
+
+def calc_work_sessions(records: list):
+    """
+    根据原始打卡流水计算工作段、总工时及异常情况。
+
+    算法（栈式 FIFO 配对）：
+        - 遇到签到：压入栈。
+        - 遇到签退：弹出最早的签到与之配对，计算本段工时。
+        - 签退时栈为空：标记"无对应签到"异常。
+        - 处理完毕栈非空：标记"未签退"异常。
+
+    Args:
+        records (list): 打卡记录列表，每项格式：
+            {"type": "签到"/"签退", "time": "YYYY-MM-DD HH:MM:SS"}
+
+    Returns:
+        tuple:
+            - sessions  (list)     : 工作段列表，每项含 sign_in、sign_out、
+                                     duration（timedelta）、note 字段。
+            - total_dur (timedelta): 所有有效工作段的累计工时。
+            - anomalies (list)     : 异常描述字符串列表。
+    """
+    sessions, anomalies, stack_in = [], [], []
+    for rec in records:
+        # 提取时间部分：支持完整 datetime 字符串或纯时间字符串
+        t_str = rec["time"][11:] if len(rec["time"]) > 8 else rec["time"]
+        if rec["type"] == "签到":
+            stack_in.append(t_str)
+        else:
+            if stack_in:
+                # 取最早的签到与当前签退配对（FIFO）
+                sign_in = stack_in.pop(0)
+                dur     = _tdiff(sign_in, t_str)
+                note    = "" if dur.total_seconds() >= 0 else "时间异常"
+                sessions.append({"sign_in": sign_in, "sign_out": t_str,
+                                  "duration": dur, "note": note})
+                if dur.total_seconds() < 0:
+                    anomalies.append(f"签退早于签到:{sign_in}→{t_str}")
+            else:
+                # 签退时栈为空，无对应签到
+                sessions.append({"sign_in": None, "sign_out": t_str,
+                                  "duration": None, "note": "无对应签到"})
+                anomalies.append(f"无对应签到:{t_str}")
+    # 处理栈中剩余的未配对签到（即未签退）
+    for si in stack_in:
+        sessions.append({"sign_in": si, "sign_out": None,
+                          "duration": None, "note": "未签退"})
+        anomalies.append(f"未签退:{si}")
+    # 按签到时间升序排列，None 排到末尾
+    sessions.sort(key=lambda s: s["sign_in"] or "99:99:99")
+    # 累计所有有效（正数工时）工作段
+    total = sum(
+        (s["duration"] for s in sessions
+         if s["duration"] and s["duration"].total_seconds() > 0),
+        timedelta()
+    )
+    return sessions, total, anomalies
+
+
+def _tdiff(t1: str, t2: str) -> timedelta:
+    """
+    计算两个时间字符串（HH:MM:SS 格式）的差值。
+
+    Args:
+        t1 (str): 起始时间字符串，格式 "%H:%M:%S"。
+        t2 (str): 结束时间字符串，格式 "%H:%M:%S"。
+
+    Returns:
+        timedelta: t2 - t1 的时间差（可能为负数，表示时间异常）。
+    """
+    fmt = "%H:%M:%S"
+    return datetime.strptime(t2, fmt) - datetime.strptime(t1, fmt)
+
+
+def fmt_dur(td) -> str:
+    """
+    将 timedelta 对象格式化为人类可读的工时字符串。
+
+    格式规则：
+        - None 或无效值 → "--"
+        - 负数（异常）  → "异常"
+        - 有小时        → "XhYYm"
+        - 仅有分钟      → "YmZZs"
+        - 仅有秒        → "ZZs"
+
+    Args:
+        td (timedelta | None): 时间差对象。
+
+    Returns:
+        str: 格式化后的工时字符串。
+    """
+    if not td: return "--"
+    s = int(td.total_seconds())
+    if s < 0: return "异常"
+    h, m, sec = s // 3600, (s % 3600) // 60, s % 60
+    if h > 0:   return f"{h}h{m:02d}m"
+    elif m > 0: return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+# ============================================================
+#                     多人帧计数器
+# ============================================================
+
+class MultiPersonCounter:
+    """
+    为每个识别到的人独立维护连续帧计数，满足阈值后触发打卡。
+
+    Bug 修复说明：
+        原版使用 "== CONFIRM_FRAMES" 判断，在 DETECT_INTERVAL > 1 的跳帧
+        场景下，计数可能从 N-1 直接跳到 N+1，导致永远无法触发。
+        本版改用 ">=" 修复此问题，并在触发后立即重置计数，
+        避免同一驻留周期内重复触发打卡。
+
+    线程安全：本类未加锁，由调用方保证单线程调用。
+    """
+
+    def __init__(self, confirm_frames: int):
+        """
+        Args:
+            confirm_frames (int): 触发打卡所需的最少连续检测帧数。
+        """
+        self.confirm_frames = confirm_frames
+        # 每个人名对应的当前连续检测帧数
+        self._counters: dict = {}
+        # 已触发打卡且尚未离开画面的人名集合（防止同一驻留周期重复触发）
+        self._triggered: set = set()
+
+    def update(self, detected_names: set) -> set:
+        """
+        用本帧检测到的人名集合更新内部计数，返回本帧应触发打卡的人名集合。
+
+        逻辑：
+            1. 不在本帧的人：计数清零，解除触发锁（允许下次重新计数）。
+            2. 本帧检测到的人：计数 +1，达到阈值且未触发过则加入返回集合。
+            3. 触发后重置计数为 0，避免持续触发。
+
+        Args:
+            detected_names (set): 本帧识别成功的人名集合。
+
+        Returns:
+            set: 本帧需要执行打卡的人名集合（可能为空集）。
+        """
+        to_attend = set()
+        # 消失的人：清零计数并解除触发锁
+        for name in list(self._counters.keys()):
+            if name not in detected_names:
+                self._counters[name] = 0
+                self._triggered.discard(name)
+        # 本帧检测到的人：累加计数并判断是否达到触发条件
+        for name in detected_names:
+            self._counters[name] = self._counters.get(name, 0) + 1
+            # 使用 >= 而非 == 避免跳帧导致永远无法触发
+            if (self._counters[name] >= self.confirm_frames
+                    and name not in self._triggered):
+                to_attend.add(name)
+                self._triggered.add(name)
+                # 触发后重置，防止同一驻留周期内重复打卡
+                self._counters[name] = 0
+        return to_attend
+
+    def reset_person(self, name: str):
+        """
+        手动重置指定人员的触发状态（通常在冷却期拒绝打卡后由外部调用）。
+
+        Args:
+            name (str): 需要重置状态的人员姓名。
+        """
+        self._triggered.discard(name)
+        self._counters[name] = 0
+
+
+# ============================================================
+#                     多条通知队列
+# ============================================================
+
+class NotificationQueue:
+    """
+    支持多人同框时同时在视频区显示多条打卡通知。
+
+    特性：
+        - 每条通知独立计时，到期自动清除。
+        - 同一人的旧通知会被新通知替换，避免重复堆叠。
+        - 超出最大数量时移除最旧的通知（FIFO）。
+        - 内部使用 threading.Lock 保证多线程安全。
+        - 剩余时间映射到透明度，实现淡出视觉效果。
+    """
+
+    def __init__(self, max_count: int = 4, duration: float = 3.0):
+        """
+        Args:
+            max_count (int)  : 同时显示的最大通知条数，默认 4。
+            duration  (float): 每条通知的显示持续时间（秒），默认 3.0。
+        """
+        self.max_count = max_count
+        self.duration  = duration
+        # 通知存储队列，每项为 dict：
+        # {"name": str, "action": str, "dur_str": str, "expire": float}
+        self._queue: deque = deque()
+        self._lock = threading.Lock()
+
+    def push(self, name: str, action: str, dur_str: str):
+        """
+        推入一条新的打卡通知。
+
+        若同一人已有通知，先移除旧通知再推入新通知。
+        若队列已满，移除最旧的通知腾出空间。
+
+        Args:
+            name    (str): 打卡人员姓名。
+            action  (str): 打卡动作（"签到" 或 "签退"）。
+            dur_str (str): 当前累计工时格式化字符串（用于通知显示）。
+        """
+        with self._lock:
+            # 移除同一人的旧通知，防止重复堆叠
+            self._queue = deque(n for n in self._queue if n["name"] != name)
+            if len(self._queue) >= self.max_count:
+                self._queue.popleft()  # 队列满时移除最旧的通知
+            self._queue.append({
+                "name":    name,
+                "action":  action,
+                "dur_str": dur_str,
+                "expire":  time.time() + self.duration  # 到期时间戳
+            })
+
+    def get_active(self) -> list:
+        """
+        获取当前所有未过期的通知列表，同时清理已过期的通知。
+
+        Returns:
+            list: 未过期通知的有序列表（按推入顺序，最旧的在前）。
+        """
+        with self._lock:
+            now = time.time()
+            # 过滤掉已过期的通知
+            self._queue = deque(n for n in self._queue if n["expire"] > now)
+            return list(self._queue)
+
+
+# ============================================================
+#                      异步文件写入器
+# ============================================================
+
+class AsyncWriter:
+    """
+    基于后台线程 + 无界队列的异步 JSON 文件写入器。
+
+    设计动机：
+        打卡触发时，主线程只需将数据放入队列即可立即返回，
+        不会因磁盘 I/O 阻塞摄像头采集帧，保证视频流畅。
+
+    改进3：写入失败时记录具体错误日志，不再静默吞异常。
+
+    注意：
+        - 后台线程为守护线程，随主进程退出自动销毁。
+        - 队列无界，不会丢失写入请求。
+        - 同一文件多次推入时，最终以最后一次为准（后写覆盖前写）。
+    """
+
+    def __init__(self):
+        """初始化写入队列并启动后台工作线程。"""
+        self._q = queue.Queue()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def write(self, path: str, data: dict):
+        """
+        将写入任务放入队列（非阻塞，立即返回）。
+
+        Args:
+            path (str) : 目标文件路径。
+            data (dict): 要序列化写入的 Python 字典。
+        """
+        self._q.put((path, data))
+
+    def _worker(self):
+        """
+        后台工作线程主循环：持续从队列取出任务并执行文件写入。
+
+        改进3：捕获具体的 OSError，记录详细错误日志，
+        不抛出异常，保证线程持续运行不中断。
+        """
+        while True:
+            path, data = self._q.get()
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                logger.debug("文件写入完成: %s", path)
+            except OSError as e:
+                logger.error("文件写入失败 (%s): %s", path, e)
+
+
+# ============================================================
+#         改进4：职责拆分 —— 四个独立类各司其职
+#
+#   FaceRecognizer    —— 人脸库加载 & 身份识别
+#   AttendanceManager —— 打卡状态 & 日志管理（含锁保护）
+#   UIRenderer        —— 所有 OpenCV / PIL 绘制逻辑
+#   AttendanceSystem  —— 组合以上三者，驱动主循环
+# ============================================================
+
+# ============================================================
+#              改进4a：人脸识别层 —— FaceRecognizer
+# ============================================================
+
+class FaceRecognizer:
+    """
+    职责：加载已知人脸库，对输入 embedding 做相似度匹配，返回身份识别结果。
+
+    设计原则：
+        与 UI 渲染、打卡逻辑完全解耦，只负责"这张脸是谁"这一问题。
+
+    改进3：
+        - InsightFace 初始化失败时记录 CRITICAL 日志并向上抛出异常，
+          不静默忽略，让调用方明确感知到初始化失败。
+        - 每张照片单独 try/except，加载失败只跳过该文件，
+          不影响其他人员的注册，并记录具体文件名和原因。
+        - 人脸检测异常时返回空列表，不导致程序崩溃。
+        - face_db 为空时直接返回 None，避免无意义遍历。
+    """
+
+    def __init__(self, known_faces_dir: str = KNOWN_FACES_DIR):
+        """
+        初始化 InsightFace 模型并加载已知人脸库。
+
+        Args:
+            known_faces_dir (str): 已知人员照片目录路径，默认 KNOWN_FACES_DIR。
+
+        Raises:
+            Exception: InsightFace 模型初始化失败时向上抛出，终止程序。
+        """
+        self._dir      = known_faces_dir
+        # 人脸特征数据库：{姓名: 归一化特征向量}
+        self.face_db: dict[str, np.ndarray] = {}
+
+        logger.info("初始化 InsightFace ...")
+        # 改进3：捕获模型加载异常，给出明确的 CRITICAL 日志后重新抛出
+        try:
+            self._app = FaceAnalysis(
+                name='buffalo_s',
+                providers=['CPUExecutionProvider']
+            )
+            self._app.prepare(ctx_id=0, det_size=(320, 320))
+        except Exception as e:
+            logger.critical("InsightFace 初始化失败: %s", e, exc_info=True)
+            raise  # 向上抛出，终止程序启动
+
+        self._build_face_db()
+        logger.info("注册人数: %d", len(self.face_db))
+
+    def _build_face_db(self):
+        """
+        扫描照片目录，逐一提取人脸特征向量，构建内存人脸数据库。
+
+        命名规则：文件名（不含扩展名）即为人员姓名。
+        支持格式：.jpg、.png（大小写不限）。
+
+        改进3：每张图片单独 try/except，失败时记录具体文件名和原因，
+        不影响其他图片加载，最终汇总输出成功/跳过数量。
+        """
+        if not os.path.exists(self._dir):
+            os.makedirs(self._dir)
+            logger.warning("known_faces 目录不存在，已自动创建: %s", self._dir)
+            return
+
+        loaded, failed = 0, 0
+        for file in os.listdir(self._dir):
+            if not file.lower().endswith(('.jpg', '.png')):
+                continue
+            name = os.path.splitext(file)[0]
+            path = os.path.join(self._dir, file)
+            try:
+                img = cv2.imread(path)
+                if img is None:
+                    raise ValueError("cv2.imread 返回 None，文件可能损坏或格式不支持")
+                faces = self._app.get(img)
+                if not faces:
+                    raise ValueError("图片中未检测到人脸")
+                self.face_db[name] = faces[0].normed_embedding
+                logger.info("  已注册: %s", name)
+                loaded += 1
+            except Exception as e:
+                logger.warning("  跳过 %s: %s", file, e)
+                failed += 1
+
+        logger.info("人脸库加载完成：成功 %d，跳过 %d", loaded, failed)
+
+    def get_faces(self, frame: np.ndarray) -> list:
+        """
+        对输入帧执行人脸检测与身份识别，返回所有人脸的位置和姓名。
+
+        改进3：检测过程中任何异常都被捕获并记录，返回空列表，
+        不向上传播异常，保证主循环不因单帧检测失败而崩溃。
+
+        Args:
+            frame (np.ndarray): 输入的 BGR 摄像头帧。
+
+        Returns:
+            list: 检测结果列表，每项格式为 (x1, y1, x2, y2, name_or_None)。
+                  name 为 None 表示未识别到已知人员。
+        """
+        try:
+            faces = self._app.get(frame)
+        except Exception as e:
+            logger.error("人脸检测异常: %s", e, exc_info=True)
+            return []
+
+        results = []
+        for face in faces:
+            x1, y1, x2, y2 = face.bbox.astype(int)
+            name = self._recognize(face.normed_embedding)
+            results.append((x1, y1, x2, y2, name))
+        return results
+
+    def _recognize(self, emb: np.ndarray) -> str | None:
+        """
+        在人脸数据库中查找与给定特征向量最相似的人员。
+
+        算法：计算输入特征与所有注册特征的余弦相似度（归一化向量点积），
+        取最大值，超过阈值则返回对应姓名，否则返回 None。
+
+        改进3：face_db 为空时直接返回 None，避免对空字典的无意义遍历。
+
+        Args:
+            emb (np.ndarray): 已归一化的人脸特征向量（来自 InsightFace）。
+
+        Returns:
+            str | None: 识别到的人员姓名，或 None（未知人员/数据库为空）。
+        """
+        if not self.face_db:
+            return None  # 数据库为空，直接返回，避免无意义遍历
+        best_name, best_sim = None, -1.0
+        for name, db_emb in self.face_db.items():
+            sim = float(np.dot(emb, db_emb))  # 归一化向量点积 = 余弦相似度
+            if sim > best_sim:
+                best_sim = sim
+                best_name = name
+        return best_name if best_sim >= SIMILARITY_THRESHOLD else None
+
+
+# ============================================================
+#          改进4b：考勤管理层 —— AttendanceManager
+# ============================================================
+
+class AttendanceManager:
+    """
+    职责：管理打卡状态与日志的读写，以及工时统计查询。
+
+    改进1（并发安全）：
+        所有对 attendance_status / attendance_log 的读写操作
+        都通过 self._lock（RLock）保护，消除主线程（打卡）与
+        导出线程（读取日志）之间的竞态条件。
+
+        关键设计：do_attendance 中的"读状态→判断→写状态"三步操作
+        在同一把锁内原子完成，不存在 TOCTOU（检查时间与使用时间）问题。
+
+    改进3（错误处理）：
+        文件加载失败时捕获具体异常（OSError、json.JSONDecodeError、KeyError），
+        记录 WARNING 日志后优雅降级（重置为空状态），不崩溃。
+    """
+
+    def __init__(self, writer: AsyncWriter):
+        """
+        Args:
+            writer (AsyncWriter): 异步文件写入器，用于非阻塞落盘。
+        """
+        self._writer = writer
+        # 改进1：RLock 允许同一线程多次获取（可重入），
+        # 防止 do_attendance 内部调用 get_work_info 时发生死锁
+        self._lock             = threading.RLock()
+        # 当日考勤状态：{姓名: {"status": "已签到"/"已签退", "last_time": timestamp}}
+        self.attendance_status: dict = {}
+        # 打卡流水日志：{姓名: [{"type": "签到"/"签退", "time": "..."}]}
+        self.attendance_log:    dict = {}
+        self._load_state()
+        self._load_log()
+
+    # ── 数据持久化：加载 ──
+
+    def _load_state(self):
+        """
+        从 STATE_FILE 恢复当日考勤状态（仅当日数据有效）。
+
+        改进3：捕获 OSError（文件不存在/权限问题）、
+        json.JSONDecodeError（文件损坏）、KeyError（字段缺失）
+        三类具体异常，记录 WARNING 后优雅降级为空状态。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        if not os.path.exists(STATE_FILE):
+            return
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") == today:
+                with self._lock:
+                    self.attendance_status = data["attendance_status"]
+                logger.info("考勤状态已恢复，共 %d 条", len(self.attendance_status))
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            logger.warning("加载考勤状态失败，将重新开始: %s", e)
+
+    def _save_state(self):
+        """
+        将当前考勤状态异步写入 STATE_FILE。
+
+        改进1：先在锁内获取数据快照，再将快照交给 AsyncWriter，
+        避免写入过程中数据被其他线程修改导致的不一致。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self._lock:
+            # 在锁内制作快照，保证写入的数据一致性
+            snapshot = {
+                "date":               today,
+                "attendance_status":  dict(self.attendance_status)
+            }
+        self._writer.write(STATE_FILE, snapshot)
+
+    def _load_log(self):
+        """
+        从 LOG_FILE 恢复当日打卡流水日志（仅当日数据有效）。
+
+        改进3：与 _load_state 相同的异常处理策略，
+        任何加载失败都记录 WARNING 后优雅降级。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        if not os.path.exists(LOG_FILE):
+            return
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") == today:
+                with self._lock:
+                    self.attendance_log = data.get("log", {})
+                logger.info("考勤日志已恢复，共 %d 人", len(self.attendance_log))
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            logger.warning("加载考勤日志失败，将重新开始: %s", e)
+
+    def _save_log(self):
+        """
+        将当前打卡流水日志异步写入 LOG_FILE。
+
+        改进1：在锁内制作深拷贝快照（list(v) 复制每人的记录列表），
+        确保写入内容不受后续打卡操作影响。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self._lock:
+            snapshot = {
+                "date": today,
+                "log":  {k: list(v) for k, v in self.attendance_log.items()}
+            }
+        self._writer.write(LOG_FILE, snapshot)
+
+    # ── 打卡核心逻辑 ──
+
+    def do_attendance(self, name: str,
+                      notif_queue: NotificationQueue,
+                      counter: MultiPersonCounter) -> bool:
+        """
+        为指定人员执行打卡操作（签到或签退）。
+
+        状态机逻辑：
+            - 不在状态表中（首次打卡）→ 签到。
+            - 已签到状态 → 签退。
+            - 已签退状态 → 签到（新一轮）。
+            - 冷却期内   → 拒绝打卡，重置帧计数器，返回 False。
+
+        改进1：整个"读状态→判断冷却→切换状态→写日志"操作
+        在同一把 RLock 内原子完成，消除竞态条件，
+        保证并发场景下不会出现重复打卡或状态错乱。
+
+        Args:
+            name        (str)                 : 需要打卡的人员姓名。
+            notif_queue (NotificationQueue)   : 打卡成功后推送通知的队列。
+            counter     (MultiPersonCounter)  : 帧计数器，冷却期内需重置。
+
+        Returns:
+            bool: True 表示实际发生了打卡；False 表示在冷却期内被跳过。
+        """
+        now     = time.time()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with self._lock:
+            if name not in self.attendance_status:
+                # 今日首次打卡：直接签到
+                self.attendance_status[name] = {
+                    "status":    "已签到",
+                    "last_time": now
+                }
+                action = "签到"
+            else:
+                info = self.attendance_status[name]
+                # 冷却期保护：防止同一人被连续快速重复打卡
+                if now - info["last_time"] < COOLDOWN_SECONDS:
+                    counter.reset_person(name)  # 重置帧计数，冷却期内不再触发
+                    return False
+                # 状态切换：已签到→签退，已签退→签到
+                action             = "签退" if info["status"] == "已签到" else "签到"
+                info["status"]    = "已签退" if action == "签退" else "已签到"
+                info["last_time"] = now
+
+            # 在锁内写入日志，保证状态与日志的原子一致性
+            self.attendance_log.setdefault(name, []).append(
+                {"type": action, "time": now_str}
+            )
+
+        # 锁外操作：获取工时、推送通知（这些操作无需锁保护）
+        dur_str, _ = self.get_work_info(name)
+        notif_queue.push(name, action, dur_str)
+        self._save_state()
+        self._save_log()
+        logger.info("[打卡] %s → %s  %s", name, action, now_str)
+        return True
+
+    # ── 查询接口（只读，加锁保证快照一致性）──
+
+    def get_stats(self) -> tuple:
+        """
+        获取当日已签到/已签退人数统计。
+
+        改进1：在锁内读取状态字典，保证统计数据的一致性快照。
+
+        Returns:
+            tuple: (signed_in, signed_out)
+                - signed_in  (int): 当前处于"已签到"（在岗）状态的人数。
+                - signed_out (int): 已完成签退的人数。
+        """
+        with self._lock:
+            total = len(self.attendance_status)
+            si    = sum(1 for v in self.attendance_status.values()
+                        if v["status"] == "已签到")
+            so    = sum(1 for v in self.attendance_status.values()
+                        if v["status"] == "已签退")
+        return si, so
+
+    def get_work_info(self, name: str) -> tuple:
+        """
+        获取指定人员当日累计工时和工作段数。
+
+        改进1：先在锁内复制记录列表（快照），再在锁外计算，
+        减少锁持有时间，避免计算耗时影响其他线程。
+
+        Args:
+            name (str): 人员姓名。
+
+        Returns:
+            tuple: (dur_str, segs)
+                - dur_str (str): 格式化后的累计工时字符串。
+                - segs    (int): 今日完成签到的次数（工作段数）。
+        """
+        with self._lock:
+            recs = list(self.attendance_log.get(name, []))  # 锁内复制快照
+        _, total, _ = calc_work_sessions(recs)  # 锁外计算，不阻塞其他操作
+        segs = sum(1 for r in recs if r["type"] == "签到")
+        return fmt_dur(total), segs
+
+    def get_status(self, name: str) -> str | None:
+        """
+        获取指定人员的当前考勤状态。
+
+        Args:
+            name (str): 人员姓名。
+
+        Returns:
+            str | None: "已签到" 或 "已签退"，不在状态表中则返回 None。
+        """
+        with self._lock:
+            info = self.attendance_status.get(name)
+        return info["status"] if info else None
+
+    def get_recent_records(self, n: int = 5) -> list:
+        """
+        获取最近 n 条打卡流水记录（按时间倒序）。
+
+        改进1：在锁内完成排序，返回独立列表，调用方可安全使用。
+
+        Args:
+            n (int): 返回记录条数，默认 5。
+
+        Returns:
+            list: 最近 n 条记录，每项格式为 (姓名, 类型, 时间字符串)。
+        """
+        with self._lock:
+            recs_all = sorted(
+                [(nm, e["type"], e["time"])
+                 for nm, logs in self.attendance_log.items() for e in logs],
+                key=lambda x: x[2], reverse=True
+            )
+        return recs_all[:n]
+
+    def snapshot_log(self) -> dict:
+        """
+        获取当前打卡日志的深拷贝快照，供导出线程安全使用。
+
+        改进1：导出操作可能耗时较长，在锁内制作快照后立即释放锁，
+        避免导出期间长时间持锁阻塞主线程的打卡操作。
+
+        Returns:
+            dict: 日志数据的深拷贝，格式与 attendance_log 相同。
+        """
+        with self._lock:
+            return {k: list(v) for k, v in self.attendance_log.items()}
+
+
+# ============================================================
+#             改进4c：UI 渲染层 —— UIRenderer
+# ============================================================
+
+class UIRenderer:
+    """
+    职责：封装所有 OpenCV / PIL 绘制逻辑，不持有考勤业务数据。
+
+    设计原则：
+        所有绘制方法通过参数接收所需数据，保持无副作用（除面板缓存外），
+        与业务逻辑层（AttendanceManager）完全解耦。
+
+    改进6 —— 面板分层刷新策略：
+        将面板渲染拆分为两个独立缓存层，解决原版"时钟更新触发完整重绘"的问题：
+
+        层1（status 层）：打卡统计、最近打卡记录、当前在场人员。
+            变化频率低，每 PANEL_STATUS_TTL（0.5s）最多重建一次。
+            重建时执行完整 PIL 文字渲染（开销较大）。
+
+        层2（时钟/FPS 层）：当前时间、帧率显示。
+            每帧无条件覆盖渲染，彻底消除秒针跳变时的闪烁现象。
+            只绘制两个小区域，开销极低。
+
+        实现方式：
+            每帧先从 status 缓存复制基底，再在基底上覆盖时钟/FPS 文字，
+            既保证时钟秒针流畅更新，又避免每帧执行完整 PIL 渲染。
+    """
+
+    def __init__(self):
+        """初始化面板缓存相关状态变量。"""
+        self._panel_status_cache = None   # status 层缓存的图像（numpy array）
+        self._panel_status_ts    = 0.0    # status 层最后一次重建的时间戳
+        self._last_clock_str     = ""     # 上一帧绘制的时钟字符串（调试用）
+        self._last_fps           = -1     # 上一帧绘制的 FPS 值（调试用）
+
+    # ── 人脸框绘制 ──
+
+    def draw_faces(self, area: np.ndarray, last_faces: list,
+                   sx: float, sy: float, cx: int, cy: int,
+                   manager: "AttendanceManager") -> np.ndarray:
+        """
+        在视频显示区绘制所有检测到的人脸框、姓名标签、工时及状态信息。
+
+        坐标变换说明：
+            人脸检测在原始帧坐标系下进行，需映射到经 crop_fill 处理后的
+            视频显示区坐标系。变换公式：
+                视频区坐标 = 原始坐标 × 缩放比 - 裁剪偏移
+
+        绘制内容（每张人脸）：
+            ① 矩形人脸框（已知人员绿色，未知人员黄色）。
+            ② 四角 L 形装饰线（增强科技感）。
+            ③ 姓名标签（框顶部上方，半透明背景）。
+            ④ 工时徽章（框底部下方，仅已知人员）。
+            ⑤ 签到状态标签（工时徽章下方，仅已打卡人员）。
+
+        性能优化：收集所有文字绘制指令，最后批量一次 PIL 转换渲染。
+
+        Args:
+            area       (np.ndarray)       : 视频显示区图像（BGR，原地修改）。
+            last_faces (list)             : 上一次检测到的人脸列表。
+            sx         (float)            : X 方向缩放比。
+            sy         (float)            : Y 方向缩放比。
+            cx         (int)              : X 方向裁剪偏移（像素）。
+            cy         (int)              : Y 方向裁剪偏移（像素）。
+            manager    (AttendanceManager): 考勤管理器（用于查询工时和状态）。
+
+        Returns:
+            np.ndarray: 绘制人脸信息后的视频区图像。
+        """
+        text_items = []  # 收集所有文字，最后批量一次 PIL 转换
+        H, W = area.shape[:2]
+
+        for (x1, y1, x2, y2, name) in last_faces:
+            # 坐标系变换：原始帧坐标 → 视频显示区坐标
+            vx1 = int(x1 * sx) - cx
+            vy1 = int(y1 * sy) - cy
+            vx2 = int(x2 * sx) - cx
+            vy2 = int(y2 * sy) - cy
+
+            # 跳过完全超出视频区边界的人脸框
+            if vx2 <= max(0, vx1) or vy2 <= max(0, vy1):
+                continue
+
+            # 颜色与标签：已知人员绿色，未知人员黄色
+            col   = C_GREEN if name else C_UNKNOWN
+            label = name or "未知人员"
+
+            # ① 矩形人脸框
+            cv2.rectangle(area, (vx1, vy1), (vx2, vy2), col, 2)
+
+            # ② 四角 L 形装饰线（增强科技感）
+            cl = 18  # 角标线段长度（像素）
+            for px, py, dx, dy in [(vx1, vy1,  1,  1), (vx2, vy1, -1,  1),
+                                    (vx1, vy2,  1, -1), (vx2, vy2, -1, -1)]:
+                cv2.line(area, (px, py), (px + dx * cl, py), col, 3)  # 水平线
+                cv2.line(area, (px, py), (px, py + dy * cl), col, 3)  # 垂直线
+
+            # ③ 姓名标签（人脸框顶部上方，半透明深色背景）
+            ly = max(vy1 - 40, 2)
+            blend_rect(area, (vx1, ly - 2),
+                       (vx1 + len(label) * 17 + 12, ly + 32), (20, 20, 20), 0.68)
+            text_items.append((label, (vx1 + 4, ly), col, 24, True))
+
+            if name:
+                # ④ 工时徽章（人脸框底部下方）
+                dur_s, segs = manager.get_work_info(name)
+                badge = f"工时:{dur_s}({segs}段)"
+                blend_rect(area, (vx1, vy2 + 4), (vx1 + 195, vy2 + 30),
+                           (20, 20, 20), 0.68)
+                text_items.append((badge, (vx1 + 4, vy2 + 6), C_CYAN, 18, False))
+
+                # ⑤ 签到状态标签（工时徽章下方，仅已打卡人员显示）
+                st = manager.get_status(name)
+                if st:
+                    sc  = C_GREEN if st == "已签到" else C_ORANGE
+                    sy_ = vy2 + 36
+                    blend_rect(area, (vx1, sy_), (vx1 + 88, sy_ + 28),
+                               (20, 20, 20), 0.68)
+                    text_items.append((st, (vx1 + 4, sy_ + 2), sc, 18, True))
+
+        # 批量执行一次 BGR→PIL→BGR 转换，渲染所有文字
+        if text_items:
+            area = draw_texts(area, text_items)
+        return area
+
+    # ── 打卡通知绘制 ──
+
+    def draw_notifications(self, area: np.ndarray,
+                           notif_queue: NotificationQueue,
+                           vw: int, vh: int) -> np.ndarray:
+        """
+        在视频区底部中央绘制打卡成功通知（支持多条同时显示，从下往上堆叠）。
+
+        通知样式：
+            - 半透明深色背景框，左侧带彩色色条（签到绿/签退橙）。
+            - 顶行：打卡人姓名 + 动作（粗体彩色）。
+            - 底行：今日累计工时（灰色小字）。
+            - 淡出效果：剩余时间越少，背景透明度越低。
+
+        Args:
+            area        (np.ndarray)       : 视频显示区图像（BGR，原地修改）。
+            notif_queue (NotificationQueue): 通知队列，提供当前有效通知列表。
+            vw          (int)              : 视频区宽度（像素）。
+            vh          (int)              : 视频区高度（像素）。
+
+        Returns:
+            np.ndarray: 绘制通知后的视频区图像。
+        """
+        notifs = notif_queue.get_active()
+        if not notifs:
+            return area
+
+        bw, bh = 440, 76   # 单条通知框的宽度和高度
+        gap    = 10         # 相邻通知框的垂直间距
+        # 从视频区底部往上排列，预留 20px 底部边距
+        total_h = len(notifs) * (bh + gap)
+        start_y = vh - total_h - 20
+        text_items = []  # 收集所有文字，批量渲染
+
+        for i, notif in enumerate(notifs):
+            name    = notif["name"]
+            action  = notif["action"]
+            dur_str = notif["dur_str"]
+            # 根据剩余时间动态计算背景透明度（实现淡出效果）
+            remain  = notif["expire"] - time.time()
+            alpha   = min(0.82, remain * 0.4)  # 最大 0.82，线性衰减
+
+            col = C_GREEN if action == "签到" else C_ORANGE  # 签到绿/签退橙
+            bx  = (vw - bw) // 2    # 水平居中
+            by  = start_y + i * (bh + gap)
+
+            # 半透明背景框
+            blend_rect(area, (bx, by), (bx + bw, by + bh), (15, 15, 15), alpha)
+            # 彩色边框
+            cv2.rectangle(area, (bx, by), (bx + bw, by + bh), col, 2)
+            # 左侧彩色色条
+            cv2.rectangle(area, (bx, by), (bx + 6, by + bh), col, -1)
+
+            text_items += [
+                (f"✔  {name}  {action}成功",
+                 (bx + 14, by + 6),  col,    24, True),   # 主文字
+                (f"今日累计工时：{dur_str}",
+                 (bx + 14, by + 40), C_GRAY, 18, False),  # 副文字
+            ]
+
+        if text_items:
+            area = draw_texts(area, text_items)
+        return area
+
+    # ── 改进6：面板分层渲染 ──
+
+    def draw_panel(self, panel: np.ndarray, pw: int, ph: int, fps: int,
+                   manager: "AttendanceManager",
+                   face_db_count: int,
+                   last_faces: list) -> np.ndarray:
+        """
+        渲染右侧信息面板（改进6：分两层缓存，分离刷新频率）。
+
+        层1 —— status 缓存（每 PANEL_STATUS_TTL 秒最多重建一次）：
+            包含：系统标题、日期、今日统计、最近打卡记录、
+                  导出按钮提示、当前在场人员、退出提示。
+            重建触发条件：缓存超期 或 面板尺寸变化 或 打卡事件（外部将 ts 置 0）。
+
+        层2 —— 时钟/FPS（每帧无条件覆盖）：
+            包含：当前时间字符串（HH:MM:SS）、帧率（FPS: XX）。
+            每帧强制擦除对应区域并重绘，彻底消除 status 层重建时
+            时钟/FPS 短暂消失导致的闪烁问题。
+
+        姓名截断优化（_fit_name）：
+            按像素宽度而非字符数截断姓名，支持中英文混排场景，
+            使用二分查找快速定位最大可显示长度。
+
+        Args:
+            panel        (np.ndarray)       : 空白面板图像（BGR，将被填充后返回）。
+            pw           (int)              : 面板宽度（像素）。
+            ph           (int)              : 面板高度（像素）。
+            fps          (int)              : 当前帧率（用于 FPS 显示）。
+            manager      (AttendanceManager): 考勤管理器（提供统计和记录数据）。
+            face_db_count(int)              : 注册人员总数。
+            last_faces   (list)             : 当前帧检测到的人脸列表（用于在场人员）。
+
+        Returns:
+            np.ndarray: 渲染完成的面板图像。
+        """
+        now    = time.time()
+        date_s = datetime.now().strftime("%Y-%m-%d")
+        time_s = datetime.now().strftime("%H:%M:%S")
+
+        # ── 层1：status 缓存（打卡统计 + 最近记录 + 在场人员）──
+        need_status = (
+            self._panel_status_cache is None                       # 首次渲染
+            or now - self._panel_status_ts >= PANEL_STATUS_TTL    # 缓存超期
+            or self._panel_status_cache.shape[:2] != (ph, pw)     # 窗口尺寸变化
+        )
+
+        if need_status:
+            # 重建 status 层：完整绘制面板所有静态内容
+            panel[:] = C_BG_PANEL  # 背景色填充
+
+            # 标题区背景与分隔线
+            cv2.rectangle(panel, (0, 0), (pw, 68), (35, 35, 35), -1)
+            cv2.line(panel, (0, 68), (pw, 68), C_ACCENT, 2)
+
+            # 获取统计数据（加锁快照）
+            si, so = manager.get_stats()
+            nc     = max(0, face_db_count - si - so)  # 未打卡人数
+            total  = face_db_count
+
+            # 统计数据块配置：(标签, 数值, 颜色, y坐标)
+            stats_cfg = [
+                ("已签到",   str(si),    C_GREEN,  204),
+                ("已签退",   str(so),    C_CYAN,   248),
+                ("未打卡",   str(nc),    C_ORANGE, 292),
+                ("注册总数", str(total), C_WHITE,  336),
+            ]
+            # 统计数据块：半透明背景框 + 左侧彩色色条
+            for _, _, col, y in stats_cfg:
+                blend_rect(panel, (10, y), (pw - 10, y + 36), (50, 50, 50), 0.5)
+                cv2.rectangle(panel, (10, y), (pw - 10, y + 36), C_BORDER, 1)
+                cv2.rectangle(panel, (10, y), (14, y + 36), col, -1)
+
+            # 最近 5 条打卡记录（按时间倒序）
+            recs_all = manager.get_recent_records(5)
+            y_rec = 432
+            for rn, rt, rtm in recs_all:
+                col = C_GREEN if rt == "签到" else C_ORANGE
+                blend_rect(panel, (10, y_rec), (pw - 10, y_rec + 44), (50, 50, 50), 0.4)
+                cv2.rectangle(panel, (10, y_rec), (pw - 10, y_rec + 44), C_BORDER, 1)
+                cv2.rectangle(panel, (10, y_rec), (14, y_rec + 44), col, -1)
+                y_rec += 50
+
+            # 导出按钮提示区
+            btn_y = y_rec + 8
+            blend_rect(panel, (10, btn_y), (pw - 10, btn_y + 36), (0, 80, 50), 0.55)
+            cv2.rectangle(panel, (10, btn_y), (pw - 10, btn_y + 36), C_ACCENT, 1)
+
+            # 当前在场人员（本帧视频区检测到的已知人员）
+            in_scene = [name for (_, _, _, _, name) in last_faces if name]
+            scene_y  = btn_y + 44
+            if in_scene:
+                cv2.line(panel, (12, scene_y), (pw - 12, scene_y), C_BORDER, 1)
+                scene_y += 8
+
+            # 收集所有静态文字绘制指令（批量渲染）
+            text_items = [
+                ("人脸考勤",     (18, 10),  C_ACCENT,  26, True),
+                ("智能管理系统", (14, 38),  C_GRAY,    17, False),
+                (date_s,         (10, 82),  C_GRAY,    18, False),
+                # 注意：时钟占位区域留空，将在层2覆盖渲染
+                ("▌ 今日统计",   (10, 170), C_ACCENT2, 20, True),
+            ]
+            # 统计数据块文字：标签 + 数值
+            for label, val, col, y in stats_cfg:
+                text_items += [
+                    (label, (20,      y + 6), C_GRAY, 18, False),
+                    (val,   (pw - 38, y + 4), col,    23, True),
+                ]
+
+            # 最近打卡区标题与分隔线
+            cv2.line(panel, (12, 384), (pw - 12, 384), C_BORDER, 1)
+            text_items.append(("▌ 最近打卡", (10, 396), C_ACCENT2, 20, True))
+
+            # ── 姓名像素宽度截断辅助工具 ──
+            # 预计算时间戳文字宽度，用于确定姓名可用像素宽度
+            _ts_font   = get_font(15, False)
+            _ts_sample = "00:00:00"
+            try:
+                _ts_w = _ts_font.getlength(_ts_sample)      # Pillow 9.2+
+            except AttributeError:
+                _ts_w = _ts_font.getsize(_ts_sample)[0]     # 旧版 Pillow 兼容
+
+            _name_font   = get_font(17, False)
+            # 姓名可用像素宽度 = 面板宽 - 左边距18 - 时间戳宽 - 间距20
+            _name_max_px = pw - 18 - int(_ts_w) - 20
+
+            def _fit_name(text: str, font, max_px: int) -> str:
+                """
+                按像素宽度截断文字，超出则尾部加 '..'。
+
+                使用二分查找快速定位最大可显示的字符数量，
+                比逐字符试探效率更高，支持中英文混排场景。
+
+                Args:
+                    text   (str)  : 原始文字。
+                    font         : PIL 字体对象。
+                    max_px (int) : 最大允许像素宽度。
+
+                Returns:
+                    str: 截断后（或原始）的文字字符串。
+                """
+                try:
+                    w = font.getlength(text)
+                except AttributeError:
+                    w = font.getsize(text)[0]
+                if w <= max_px:
+                    return text  # 未超出，直接返回原文字
+                # 二分查找：找到最长能放下"前缀 + .."的前缀长度
+                lo, hi = 0, len(text)
+                while lo < hi - 1:
+                    mid = (lo + hi) // 2
+                    try:
+                        tw = font.getlength(text[:mid] + "..")
+                    except AttributeError:
+                        tw = font.getsize(text[:mid] + "..")[0]
+                    if tw <= max_px:
+                        lo = mid
+                    else:
+                        hi = mid
+                return text[:lo] + ".."
+
+            # 最近打卡记录文字（姓名按像素宽度截断，时间戳右对齐）
+            y_rec2 = 432
+            for rn, rt, rtm in recs_all:
+                col = C_GREEN if rt == "签到" else C_ORANGE
+                dn  = _fit_name(rn, _name_font, _name_max_px)
+                ts  = rtm[11:]  # 仅取 HH:MM:SS 部分
+                text_items += [
+                    (dn, (18,                          y_rec2 + 2),  C_WHITE, 17, False),
+                    (rt, (18,                          y_rec2 + 24), col,     15, True),
+                    (ts, (pw - 10 - int(_ts_w),        y_rec2 + 14), C_GRAY,  15, False),
+                ]
+                y_rec2 += 50
+
+            # 导出按钮提示文字
+            text_items.append(("按 E 导出Excel", (16, btn_y + 9), C_ACCENT, 17, True))
+
+            # 当前在场人员列表（最多显示 6 人）
+            if in_scene:
+                text_items.append(("▌ 当前在场", (10, scene_y), C_ACCENT2, 19, True))
+                scene_y += 30
+                for sname in in_scene[:6]:
+                    text_items.append((sname, (14, scene_y), C_GREEN, 17, False))
+                    scene_y += 24
+
+            # 退出提示（底部固定位置）
+            text_items.append(("按 Q 退出", (12, ph - 30), C_GRAY, 16, False))
+
+            # 批量渲染所有静态文字（一次 PIL 转换）
+            panel = draw_texts(panel, text_items)
+
+            # 保存 status 层缓存
+            self._panel_status_cache = panel.copy()
+            self._panel_status_ts    = now
+        else:
+            # 缓存有效：直接复用 status 层，避免重复 PIL 渲染
+            np.copyto(panel, self._panel_status_cache)
+
+        # ── 层2：时钟 + FPS（每帧无条件覆盖，彻底消除闪烁）──
+        #
+        # 设计说明：
+        #   status 层每 0.5s 重建一次，重建时会清空整个面板背景。
+        #   若时钟/FPS 依赖"值变化"条件触发渲染，则在 status 层
+        #   刚重建的那一帧，时钟/FPS 文字会短暂消失，产生闪烁。
+        #
+        #   解决方案：每帧都强制擦除时钟/FPS 所在区域并重新渲染，
+        #   不依赖任何缓存条件，从根本上消除闪烁问题。
+        fps_y = ph - 52
+        # 擦除时钟和 FPS 区域（用面板背景色覆盖）
+        cv2.rectangle(panel, (0, fps_y - 2), (pw, fps_y + 24), C_BG_PANEL, -1)
+        # 覆盖渲染时钟和 FPS 文字
+        panel = draw_texts(panel, [
+            (time_s,         (6,  106),  C_WHITE, 34, True),   # 时钟大字
+            (f"FPS: {fps}",  (12, fps_y), C_GRAY, 17, False),  # 帧率小字
+        ])
+        # 记录最后渲染值（供调试使用）
+        self._last_clock_str = time_s
+        self._last_fps       = fps
+
+        return panel
+
+
+# ============================================================
+#             改进4d：Excel 报表导出（独立函数）
+# ============================================================
+
+def export_to_excel(attendance_log: dict, face_db_names: list,
+                    export_dir: str = EXPORT_DIR) -> str:
+    """
+    将当日考勤数据导出为格式化的多 Sheet Excel 报表。
+
+    报表结构（4 个 Sheet）：
+        Sheet1 - 考勤汇总：每人今日状态、首末打卡时间、总工时、异常说明。
+        Sheet2 - 工时明细：按工作段展示每段签到/签退时间及累计工时。
+        Sheet3 - 原始记录：所有打卡流水，按时间升序排列。
+        Sheet4 - 异常汇总：当日所有考勤异常的聚合视图。
+
+    改进3：
+        报表保存失败时捕获 OSError，记录 ERROR 日志并向上抛出，
+        让调用方明确感知导出失败，不静默忽略。
+        合并单元格失败时记录 DEBUG 日志并跳过，不影响整体导出。
+
+    Args:
+        attendance_log (dict): 考勤日志快照，格式 {姓名: [打卡记录, ...]}。
+                               应传入 manager.snapshot_log() 的返回值（线程安全）。
+        face_db_names  (list): 已注册人员姓名列表（用于补全未打卡人员）。
+        export_dir     (str) : 报表输出目录，默认 EXPORT_DIR。
+
+    Returns:
+        str: 生成的 Excel 文件完整路径。
+
+    Raises:
+        OSError: 文件保存失败时（磁盘满、权限不足等）向上抛出。
+    """
+    os.makedirs(export_dir, exist_ok=True)
+    today    = datetime.now().strftime("%Y-%m-%d")
+    filename = os.path.join(export_dir, f"考勤报表_{today}.xlsx")
+    wb       = openpyxl.Workbook()
+
+    # ── 样式定义 ──
+    # 单元格填充色
+    HEADER_FILL = PatternFill("solid", fgColor="1E3A5F")  # 深蓝，表头背景
+    SUB_FILL    = PatternFill("solid", fgColor="2E6096")  # 中蓝，合计行
+    GREEN_FILL  = PatternFill("solid", fgColor="E2EFDA")  # 浅绿，签到/正常
+    ORANGE_FILL = PatternFill("solid", fgColor="FCE4D6")  # 浅橙，签退/未打卡
+    GRAY_FILL   = PatternFill("solid", fgColor="F2F2F2")  # 浅灰，交替行
+    RED_FILL    = PatternFill("solid", fgColor="FFDDE1")  # 浅红，异常
+    BLUE_FILL   = PatternFill("solid", fgColor="DDEEFF")  # 浅蓝，标题行
+    WHITE_FILL  = PatternFill("solid", fgColor="FFFFFF")  # 白色，正常行
+    YELLOW_FILL = PatternFill("solid", fgColor="FFF2CC")  # 浅黄，未签退
+    DBLUE_FILL  = PatternFill("solid", fgColor="D9E1F2")  # 浅蓝，小计行
+
+    # 字体样式
+    H_FONT     = Font(name="微软雅黑", bold=True,  color="FFFFFF", size=11)  # 表头（白色粗体）
+    BOLD_FONT  = Font(name="微软雅黑", bold=True,  size=10)                  # 数据粗体
+    NORM_FONT  = Font(name="微软雅黑",             size=10)                  # 普通数据
+    SMALL_FONT = Font(name="微软雅黑",             size=9,  color="666666")  # 副标题小字
+    RED_FONT   = Font(name="微软雅黑", bold=True,  size=10, color="C00000")  # 红色粗体（异常）
+    GREEN_FONT = Font(name="微软雅黑", bold=True,  size=10, color="375623")  # 绿色粗体（正常）
+    TITLE_FONT = Font(name="微软雅黑", bold=True,  size=14, color="1E3A5F")  # 大标题
+
+    # 对齐方式
+    CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    LEFT   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+    def thin():
+        """返回四周统一的细边框样式对象（CCCCCC 浅灰色）。"""
+        s = Side(style="thin", color="CCCCCC")
+        return Border(top=s, bottom=s, left=s, right=s)
+
+    def hdr(cell, text, fill=None, font=None):
+        """
+        快捷设置表头单元格样式（居中、边框、填充、字体）。
+
+        Args:
+            cell        : openpyxl 单元格对象。
+            text  (str) : 单元格显示文字。
+            fill        : 背景填充，默认 HEADER_FILL（深蓝）。
+            font        : 字体样式，默认 H_FONT（白色粗体）。
+        """
+        cell.value     = text
+        cell.fill      = fill or HEADER_FILL
+        cell.font      = font or H_FONT
+        cell.alignment = CENTER
+        cell.border    = thin()
+
+    # 合并注册人员与已打卡人员，按姓名排序，确保未打卡人员也出现在报表中
+    all_names = sorted(set(list(face_db_names) + list(attendance_log.keys())))
+
+    # ── Sheet1：考勤汇总 ──
+    ws1 = wb.active
+    ws1.title = "考勤汇总"
+
+    # 第1行：报表大标题（跨10列合并）
+    ws1.merge_cells("A1:J1")
+    c = ws1["A1"]
+    c.value = f"📋  员工考勤汇总报表  —  {today}"
+    c.font = TITLE_FONT; c.alignment = CENTER; c.fill = BLUE_FILL
+    ws1.row_dimensions[1].height = 36
+
+    # 第2行：导出时间 + 注册人数副标题
+    ws1.merge_cells("A2:J2")
+    c = ws1["A2"]
+    c.value = (f"导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+               f"    注册人数：{len(face_db_names)}")
+    c.font = SMALL_FONT; c.alignment = CENTER; c.fill = GRAY_FILL
+    ws1.row_dimensions[2].height = 20
+
+    # 第3行：列标题，同时设置列宽
+    s1h = ["序号", "姓名", "今日状态", "首次签到", "最后签退",
+           "有效工时", "工作段数", "签到次数", "签退次数", "异常说明"]
+    s1w = [6, 14, 10, 12, 12, 12, 10, 10, 10, 30]
+    for ci, (h, w) in enumerate(zip(s1h, s1w), 1):
+        hdr(ws1.cell(row=3, column=ci), h)
+        ws1.column_dimensions[get_column_letter(ci)].width = w
+    ws1.row_dimensions[3].height = 28
+
+    # 第4行起：逐人填充数据
+    row = 4
+    for idx, name in enumerate(all_names, 1):
+        records  = attendance_log.get(name, [])
+        sessions, total_dur, anomalies = calc_work_sessions(records)
+        si_cnt   = sum(1 for r in records if r["type"] == "签到")
+        so_cnt   = sum(1 for r in records if r["type"] == "签退")
+        first_in = next((s["sign_in"]  for s in sessions if s["sign_in"]),  "--")
+        last_out = next((s["sign_out"] for s in reversed(sessions)
+                         if s["sign_out"]), "--")
+        # 今日状态判断
+        if not records:
+            status = "未打卡"; sf = ORANGE_FILL
+        elif any(s["note"] == "未签退" for s in sessions):
+            status = "在岗中"; sf = GREEN_FILL
+        else:
+            status = "已完成"; sf = GRAY_FILL
+
+        anom = "；".join(anomalies) if anomalies else "正常"
+        # 斑马纹：偶数行浅灰，奇数行白色
+        rf   = GRAY_FILL if idx % 2 == 0 else WHITE_FILL
+        vals = [idx, name, status, first_in, last_out,
+                fmt_dur(total_dur), len(sessions), si_cnt, so_cnt, anom]
+        for ci, v in enumerate(vals, 1):
+            cell = ws1.cell(row=row, column=ci, value=v)
+            cell.alignment = CENTER if ci != 10 else LEFT
+            cell.border    = thin()
+            # 按列应用不同的填充/字体样式
+            if ci == 3:
+                # 状态列：颜色区分在岗/完成/未打卡
+                cell.fill = sf
+                cell.font = (RED_FONT   if status == "未打卡"
+                             else GREEN_FONT if status == "在岗中"
+                             else BOLD_FONT)
+            elif ci == 6:
+                # 有效工时列：有工时绿色，无工时橙/红
+                cell.fill = GREEN_FILL if total_dur.total_seconds() > 0 else ORANGE_FILL
+                cell.font = GREEN_FONT if total_dur.total_seconds() > 0 else RED_FONT
+            elif ci == 10 and anom != "正常":
+                # 异常说明列：有异常红色高亮
+                cell.fill = RED_FILL; cell.font = RED_FONT
+            else:
+                cell.fill = rf
+                cell.font = BOLD_FONT if ci == 2 else NORM_FONT
+        ws1.row_dimensions[row].height = 22
+        row += 1
+
+    # 最后一行：合计/汇总行
+    checked = sum(1 for n in all_names if attendance_log.get(n))
+    ws1.merge_cells(f"A{row}:B{row}")
+    for ci in range(1, 11):
+        c = ws1.cell(row=row, column=ci)
+        c.fill = SUB_FILL; c.font = H_FONT
+        c.alignment = CENTER; c.border = thin()
+    ws1.cell(row=row, column=1).value = "合计 / 平均"
+    ws1.cell(row=row, column=3).value = f"已打卡:{checked}/{len(all_names)}"
+    ws1.row_dimensions[row].height = 24
+    ws1.freeze_panes = "A4"  # 冻结前三行（标题+副标题+列头）
+
+    # ── Sheet2：工时明细 ──
+    ws2 = wb.create_sheet("工时明细")
+    ws2.merge_cells("A1:H1")
+    c = ws2["A1"]
+    c.value = f"📊  工时明细表  —  {today}"
+    c.font = TITLE_FONT; c.alignment = CENTER; c.fill = BLUE_FILL
+    ws2.row_dimensions[1].height = 34
+
+    # 列头及列宽设置
+    s2h = ["序号", "姓名", "工作段", "签到时间", "签退时间", "本段工时", "状态备注", "累计工时"]
+    s2w = [6, 14, 9, 14, 14, 12, 14, 12]
+    for ci, (h, w) in enumerate(zip(s2h, s2w), 1):
+        hdr(ws2.cell(row=2, column=ci), h)
+        ws2.column_dimensions[get_column_letter(ci)].width = w
+    ws2.row_dimensions[2].height = 26
+
+    drow = 3  # 数据起始行号
+    for gidx, name in enumerate(all_names, 1):
+        records  = attendance_log.get(name, [])
+        sessions, total_dur, _ = calc_work_sessions(records)
+
+        # 该人无打卡记录：填充单行占位
+        if not sessions:
+            for ci, v in enumerate([gidx, name, "--", "--", "--", "--", "未打卡", "--"], 1):
+                c = ws2.cell(row=drow, column=ci, value=v)
+                c.font = NORM_FONT; c.alignment = CENTER
+                c.fill = ORANGE_FILL; c.border = thin()
+            ws2.row_dimensions[drow].height = 20; drow += 1; continue
+
+        name_start  = drow       # 记录姓名列合并的起始行号
+        running_dur = timedelta() # 当前累计工时（逐段累加）
+
+        for sidx, seg in enumerate(sessions, 1):
+            # 累计有效工时（负数工时不计入）
+            if seg["duration"] and seg["duration"].total_seconds() > 0:
+                running_dur += seg["duration"]
+            # 根据异常类型选择行背景色
+            if seg["note"] == "未签退":
+                rf2 = YELLOW_FILL
+            elif seg["note"] in ("无对应签到", "时间异常"):
+                rf2 = RED_FILL
+            else:
+                rf2 = WHITE_FILL if sidx % 2 else GRAY_FILL  # 斑马纹
+
+            row_vals = [
+                gidx if sidx == 1 else "",    # 序号只在第一段显示
+                name if sidx == 1 else "",    # 姓名只在第一段显示
+                f"第{sidx}段",
+                seg["sign_in"]  or "--",
+                seg["sign_out"] or "--",
+                fmt_dur(seg["duration"]),
+                seg["note"] or "正常",
+                fmt_dur(running_dur)           # 截至本段的累计工时
+            ]
+            for ci, v in enumerate(row_vals, 1):
+                c = ws2.cell(row=drow, column=ci, value=v)
+                c.alignment = CENTER; c.border = thin(); c.fill = rf2
+                c.font = (GREEN_FONT if ci == 6 and seg["note"] == ""
+                          else RED_FONT if ci == 7 and seg["note"] not in ("", "正常")
+                          else NORM_FONT)
+            ws2.row_dimensions[drow].height = 20; drow += 1
+
+        # 小计行：汇总该人所有工作段
+        for ci, v in enumerate(["", "", "小计", "", "",
+                                 fmt_dur(total_dur),
+                                 f"共{len(sessions)}段",
+                                 fmt_dur(total_dur)], 1):
+            c = ws2.cell(row=drow, column=ci, value=v)
+            c.font = BOLD_FONT; c.fill = DBLUE_FILL
+            c.alignment = CENTER; c.border = thin()
+        ws2.row_dimensions[drow].height = 20; drow += 1
+
+        # 合并序号列和姓名列（跨越该人所有工作段行，视觉上归属同一人）
+        if drow - 2 >= name_start:
+            try:
+                for col in (1, 2):
+                    ws2.merge_cells(start_row=name_start, start_column=col,
+                                    end_row=drow - 2, end_column=col)
+                    cell = ws2.cell(row=name_start, column=col)
+                    cell.alignment = CENTER; cell.font = BOLD_FONT
+            except Exception as e:
+                # 单行不需要合并时会抛出异常，静默跳过并记录 DEBUG 日志
+                logger.debug("合并单元格跳过: %s", e)
+
+    ws2.freeze_panes = "A3"
+
+    # ── Sheet3：原始打卡流水 ──
+    ws3 = wb.create_sheet("原始记录")
+    ws3.merge_cells("A1:E1")
+    c = ws3["A1"]
+    c.value = f"📝  原始打卡流水  —  {today}"
+    c.font = TITLE_FONT; c.alignment = CENTER; c.fill = BLUE_FILL
+    ws3.row_dimensions[1].height = 34
+
+    # 列头设置
+    for ci, (h, w) in enumerate(zip(["序号", "姓名", "类型", "打卡时间", "备注"],
+                                     [6, 14, 10, 22, 20]), 1):
+        hdr(ws3.cell(row=2, column=ci), h)
+        ws3.column_dimensions[get_column_letter(ci)].width = w
+    ws3.row_dimensions[2].height = 26
+
+    # 将所有人的打卡记录展开并按时间升序排列
+    all_raw = sorted(
+        [(n, e["type"], e["time"])
+         for n, logs in attendance_log.items() for e in logs],
+        key=lambda x: x[2]
+    )
+    for ridx, (rn, rt, rtm) in enumerate(all_raw, 1):
+        rf3 = GREEN_FILL if rt == "签到" else ORANGE_FILL
+        for ci, v in enumerate([ridx, rn, rt, rtm, ""], 1):
+            c = ws3.cell(row=ridx + 2, column=ci, value=v)
+            c.font = (GREEN_FONT if rt == "签到"  and ci == 3
+                      else RED_FONT if rt == "签退" and ci == 3
+                      else NORM_FONT)
+            c.fill = rf3; c.alignment = CENTER; c.border = thin()
+        ws3.row_dimensions[ridx + 2].height = 20
+    ws3.freeze_panes = "A3"
+
+    # ── Sheet4：考勤异常汇总 ──
+    ws4 = wb.create_sheet("异常汇总")
+    ws4.merge_cells("A1:D1")
+    c = ws4["A1"]
+    c.value = f"⚠  考勤异常汇总  —  {today}"
+    c.font = TITLE_FONT; c.alignment = CENTER
+    c.fill = PatternFill("solid", fgColor="FFD7D7")  # 浅红标题背景
+    ws4.row_dimensions[1].height = 34
+
+    # 列头（使用深红色表头强调异常性质）
+    for ci, (h, w) in enumerate(zip(["序号", "姓名", "异常类型", "详细说明"],
+                                     [6, 14, 18, 40]), 1):
+        hdr(ws4.cell(row=2, column=ci), h,
+            fill=PatternFill("solid", fgColor="C00000"))
+        ws4.column_dimensions[get_column_letter(ci)].width = w
+    ws4.row_dimensions[2].height = 26
+
+    arow = 3; aidx = 1; has_anom = False
+    for name in all_names:
+        _, _, anomalies = calc_work_sessions(attendance_log.get(name, []))
+        for anom in anomalies:
+            has_anom = True
+            # 异常类型分类（按关键字匹配）
+            atype = ("未签退"     if "未签退"     in anom
+                     else "无对应签到" if "无对应签到" in anom
+                     else "时间异常")
+            for ci, v in enumerate([aidx, name, atype, anom], 1):
+                c = ws4.cell(row=arow, column=ci, value=v)
+                c.font = RED_FONT if ci >= 3 else NORM_FONT
+                c.fill = RED_FILL
+                c.alignment = LEFT if ci == 4 else CENTER
+                c.border = thin()
+            ws4.row_dimensions[arow].height = 20
+            arow += 1; aidx += 1
+
+    # 无异常时显示绿色提示行
+    if not has_anom:
+        ws4.merge_cells("A3:D3")
+        c = ws4.cell(row=3, column=1, value="✅  今日无考勤异常")
+        c.font = GREEN_FONT
+        c.fill = PatternFill("solid", fgColor="E2EFDA")
+        c.alignment = CENTER
+        ws4.row_dimensions[3].height = 28
+
+    # 改进3：保存失败时捕获具体异常，记录日志并向上抛出
+    try:
+        wb.save(filename)
+        logger.info("报表已导出：%s", filename)
+    except OSError as e:
+        logger.error("报表保存失败: %s", e)
+        raise  # 向上抛出，让调用方明确感知导出失败
+    return filename
+
+
+# ============================================================
+#          改进4d：主系统（组合层）—— AttendanceSystem
+# ============================================================
+
+class AttendanceSystem:
+    """
+    考勤管理系统主类（组合层）。
+
+    职责：
+        组合 FaceRecognizer、AttendanceManager、UIRenderer 三个子系统，
+        驱动摄像头采集主循环，协调各模块协作，处理键盘事件。
+
+    设计原则：
+        本类自身不包含任何识别算法、UI 绘制细节或考勤状态逻辑，
+        仅负责数据流的串联和事件的分发，保持高层逻辑的清晰性。
+
+    改进3：
+        - 摄像头打开失败时记录 CRITICAL 日志并优雅退出，不崩溃。
+        - 摄像头读帧失败时记录 WARNING 日志并跳过该帧，不中断循环。
+        - 捕获 KeyboardInterrupt（Ctrl+C），确保资源正确释放。
+        - 使用 finally 块保证摄像头和窗口在任何情况下都能被释放。
+    """
+
+    def __init__(self):
+        """
+        初始化所有子系统：
+        AsyncWriter → FaceRecognizer → AttendanceManager → UIRenderer。
+        组件按依赖顺序初始化，任何子系统初始化失败都会向上传播。
+        """
+        # 异步文件写入器（最先初始化，供 AttendanceManager 使用）
+        self._writer    = AsyncWriter()
+        # 人脸识别层（加载模型和人脸库）
+        self.recognizer = FaceRecognizer()
+        # 考勤管理层（恢复当日状态和日志）
+        self.manager    = AttendanceManager(self._writer)
+        # UI 渲染层（初始化面板缓存状态）
+        self.renderer   = UIRenderer()
+
+        # 多人帧计数确认器
+        self._counter     = MultiPersonCounter(CONFIRM_FRAMES)
+        # 多条打卡通知队列
+        self._notif_queue = NotificationQueue(MAX_NOTIFICATIONS, duration=3.0)
+
+        # 帧计数器（用于控制检测频率）
+        self.frame_count = 0
+        # 上一次检测到的人脸列表，非检测帧复用，保持绘制连续性
+        self.last_faces: list = []
+
+        logger.info("系统初始化完成 | 注册人数: %d | E=导出  Q=退出",
+                    len(self.recognizer.face_db))
+
+    def run(self):
+        """
+        系统主循环：采集视频帧 → 检测识别 → 渲染 UI → 响应键盘事件。
+
+        帧处理流程：
+            1. 读取摄像头帧并水平翻转（镜像显示）。
+            2. 每 DETECT_INTERVAL 帧执行一次人脸检测与识别。
+            3. MultiPersonCounter 统计连续帧数，达到阈值触发打卡。
+            4. crop_fill 将摄像头帧适配到视频显示区尺寸。
+            5. 渲染人脸框、通知、信息面板，合并为最终显示帧。
+
+        键盘事件：
+            Q → 退出主循环（finally 中自动导出报表并释放资源）。
+            E → 在后台线程中异步导出 Excel 报表，不阻塞视频流。
+
+        改进3：
+            - 摄像头打开失败时记录 CRITICAL 并优雅返回。
+            - 读帧失败时记录 WARNING 并跳过（continue），不退出循环。
+            - KeyboardInterrupt（Ctrl+C）被单独捕获，确保资源释放。
+            - finally 块保证任何退出路径都能释放摄像头和窗口资源。
+        """
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 最小缓冲区，降低延迟
+
+        # 改进3：摄像头打开失败时优雅退出
+        if not cap.isOpened():
+            logger.critical("无法打开摄像头，程序退出")
+            return
+
+        # 创建全屏窗口
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(WINDOW_NAME,
+                              cv2.WND_PROP_FULLSCREEN,
+                              cv2.WINDOW_FULLSCREEN)
+
+        fps_t = time.time(); fps_cnt = fps = 0
+        display_buf = None  # 最终合并帧的预分配缓冲区
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    # 改进3：读帧失败跳过该帧，不退出循环
+                    logger.warning("摄像头读帧失败，跳过")
+                    continue
+                frame = cv2.flip(frame, 1)  # 水平翻转，实现镜像效果
+                orig_h, orig_w = frame.shape[:2]
+
+                # ── FPS 计算 ──
+                fps_cnt += 1
+                if time.time() - fps_t >= 1.0:
+                    fps = fps_cnt; fps_cnt = 0; fps_t = time.time()
+
+                self.frame_count += 1
+
+                # ── 人脸检测与识别（每 DETECT_INTERVAL 帧执行一次）──
+                if self.frame_count % DETECT_INTERVAL == 0:
+                    self.last_faces = self.recognizer.get_faces(frame)
+                    # 提取本帧识别成功的人名集合
+                    detected_names  = {name for (_, _, _, _, name)
+                                       in self.last_faces if name}
+                    # 多人帧计数器更新，返回本帧应触发打卡的人名集合
+                    to_attend = self._counter.update(detected_names)
+                    for name in to_attend:
+                        self.manager.do_attendance(
+                            name, self._notif_queue, self._counter)
+                        # 打卡成功后强制使面板 status 层缓存失效
+                        self.renderer._panel_status_ts = 0.0
+
+                # ── 获取当前窗口实际尺寸 ──
+                try:
+                    wr = cv2.getWindowImageRect(WINDOW_NAME)
+                    ww, wh = wr[2], wr[3]
+                    if ww <= 0 or wh <= 0:
+                        raise ValueError("窗口尺寸无效")
+                except Exception:
+                    ww, wh = 1920, 1080  # 获取失败时使用默认全屏分辨率
+
+                # ── 计算布局尺寸 ──
+                pw = max(240, int(ww * PANEL_RATIO))  # 面板宽度（至少 240px）
+                vw = ww - pw                           # 视频区宽度
+                vh = wh                                # 视频区高度（同窗口高度）
+
+                # ── 缩放参数（用于人脸框坐标变换）──
+                sc = max(vw / orig_w, vh / orig_h)    # crop_fill 缩放比
+                cx = (int(orig_w * sc) - vw) // 2     # X 方向裁剪偏移
+                cy = (int(orig_h * sc) - vh) // 2     # Y 方向裁剪偏移
+
+                # ── 渲染各区域 ──
+                video = self._crop_fill(frame, vw, vh)  # ① 视频区适配
+                video = self.renderer.draw_faces(        # ② 人脸框与标签
+                    video, self.last_faces, sc, sc, cx, cy, self.manager)
+                video = self.renderer.draw_notifications( # ③ 打卡通知
+                    video, self._notif_queue, vw, vh)
+                cv2.line(video, (vw - 1, 0), (vw - 1, vh), C_ACCENT, 2)  # ④ 分隔线
+
+                panel = np.zeros((vh, pw, 3), dtype=np.uint8)
+                panel = self.renderer.draw_panel(         # ⑤ 信息面板
+                    panel, pw, vh, fps, self.manager,
+                    len(self.recognizer.face_db), self.last_faces)
+
+                # ── 合并视频区与面板区（预分配缓冲区，避免每帧内存分配）──
+                if display_buf is None or display_buf.shape != (vh, ww, 3):
+                    display_buf = np.empty((vh, ww, 3), dtype=np.uint8)
+                display_buf[:, :vw]      = video
+                display_buf[:, vw:vw+pw] = panel
+
+                cv2.imshow(WINDOW_NAME, display_buf)
+
+                # ── 键盘事件处理 ──
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break  # 退出主循环
+                elif key == ord('e'):
+                    # 后台线程异步导出，不阻塞视频流
+                    threading.Thread(target=self._do_export, daemon=True).start()
+
+        except KeyboardInterrupt:
+            # 捕获 Ctrl+C，确保后续 finally 正常执行资源释放
+            logger.info("检测到 Ctrl+C，正在退出...")
+        finally:
+            # 无论何种退出方式，都保证释放摄像头和销毁窗口
+            cap.release()
+            cv2.destroyAllWindows()
+            logger.info("退出时自动导出报表...")
+            self._do_export()  # 退出时同步导出最终报表
+
+    @staticmethod
+    def _crop_fill(frame, tw, th):
+        """
+        将输入帧等比缩放并居中裁剪到目标尺寸（类似 CSS background-size: cover）。
+
+        保持宽高比的前提下，取宽/高缩放比中较大的一个，
+        缩放后从中心裁剪出 (tw, th) 大小的区域，填满视频显示区。
+
+        Args:
+            frame (np.ndarray): 原始摄像头帧（BGR）。
+            tw    (int)        : 目标宽度（像素）。
+            th    (int)        : 目标高度（像素）。
+
+        Returns:
+            np.ndarray: 裁剪后的 (th, tw, 3) BGR 图像。
+        """
+        fh, fw = frame.shape[:2]
+        s  = max(tw / fw, th / fh)    # 取较大缩放比，保证覆盖目标区域
+        nw, nh = int(fw * s), int(fh * s)
+        r  = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        ox, oy = (nw - tw) // 2, (nh - th) // 2  # 居中裁剪偏移量
+        return r[oy:oy + th, ox:ox + tw]
+
+    def _do_export(self):
+        """
+        执行 Excel 报表导出（捕获所有异常，防止导出失败影响主系统）。
+
+        改进1：通过 manager.snapshot_log() 获取日志快照，
+        避免导出过程中主线程继续打卡导致的数据竞争。
+
+        可在主线程（退出时同步调用）或后台线程（按 E 时异步调用）中使用。
+        """
+        try:
+            # 改进1：先获取快照，再导出，避免导出期间数据被修改
+            log_snapshot = self.manager.snapshot_log()
+            export_to_excel(log_snapshot, list(self.recognizer.face_db.keys()))
+        except Exception as ex:
+            logger.error("导出失败: %s", ex, exc_info=True)
+
+
+# ============================================================
+#                         程序入口
+# ============================================================
+
+if __name__ == "__main__":
+    system = AttendanceSystem()
+    system.run()
